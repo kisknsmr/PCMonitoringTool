@@ -8,15 +8,37 @@ import collections
 import json
 import re
 
-# .NETランタイムのインポートをmainブロックに移動
+# .NETランタイムのインポートはmainブロックで行う
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QTableWidget, QTableWidgetItem,
     QHeaderView, QGroupBox, QProgressBar, QComboBox, QCheckBox
 )
-from PyQt6.QtGui import QFont, QPainter, QPen, QColor, QPainterPath
+from PyQt6.QtGui import QFont, QPainter, QPen, QColor, QPainterPath, QIcon
 from PyQt6.QtCore import QTimer, Qt, QPointF, QByteArray
+
+
+# ==========================
+# 実行パス／DLLパスの設定
+# ==========================
+def base_dir():
+    """
+    IDE実行時: .../PCMonitoringTool
+    EXE実行時: .../dist/PC_Performance_Monitor
+    """
+    return os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) \
+        else os.path.dirname(os.path.abspath(__file__))
+
+
+# ★ 修正点: 実行モードによってDLLの場所を切り替える
+base_dir_path = base_dir()
+if getattr(sys, 'frozen', False):
+    # PyInstaller実行時 (EXEと同じ場所)
+    DLLS_DIR = base_dir_path
+else:
+    # IDE実行時 (スクリプトの 'DLLs' サブフォルダ)
+    DLLS_DIR = os.path.join(base_dir_path, 'DLLs')
 
 # グローバル変数としてcomputerとHardwareを初期化
 computer = None
@@ -36,12 +58,14 @@ class PROCINFO(ctypes.Structure):
 
 
 # ==========================
-# DLLのロードと関数定義
+# C++ DLLのロードと関数定義
 # ==========================
 try:
-    base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
-    dll_pc_path = os.path.join(base_path, "pcmonitor.dll")
-    dll_core_path = os.path.join(base_path, "getcoreinfo.dll")
+    # ★ 修正点: os.add_dll_directory のブロックを "削除" (不要)
+
+    # DLLS_DIR (切り替え後のパス) からDLLパスを構築
+    dll_pc_path = os.path.join(DLLS_DIR, "pcmonitor.dll")
+    dll_core_path = os.path.join(DLLS_DIR, "getcoreinfo.dll")
 
     dll_pc = ctypes.CDLL(dll_pc_path)
     dll_core = ctypes.CDLL(dll_core_path)
@@ -73,13 +97,14 @@ try:
     dll_core.get_core_count.restype = ctypes.c_int
     dll_core.get_core_usage.argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.c_int]
     dll_core.get_core_usage.restype = ctypes.c_int
+    print("[INFO] C++ DLL (pcmonitor, getcoreinfo) のロードに成功しました。")
 except (FileNotFoundError, OSError) as e:
     print(f"DLLのロードに失敗しました: {e}")
     sys.exit(1)
 
 
 # ==========================
-# LibreHardwareMonitor の初期化
+# LibreHardwareMonitor の初期化 (関数内インポート)
 # ==========================
 def initialize_hardware_monitor():
     """LibreHardwareMonitorを初期化する"""
@@ -90,6 +115,7 @@ def initialize_hardware_monitor():
         computer = Hardware.Computer()
         computer.IsCpuEnabled = True
         computer.Open()
+        print("[INFO] LibreHardwareMonitorの初期化に成功しました。")
     except Exception as e:
         print(f"LibreHardwareMonitorの初期化に失敗しました: {e}")
         computer = None
@@ -208,15 +234,22 @@ class MonitorApp(QMainWindow):
         self.core_count = dll_core.get_core_count()
         self.data_cache, self.last_logged_core_data, self.log_paths, self.log_controls = {}, {}, {}, {}
         self.data_lock = threading.Lock()
-        self.dll_proc_lock = threading.Lock()  # [追加] DLLのプロセスアクセス用ロック
+        self.dll_proc_lock = threading.Lock()
         self.core_log_buffer = []
         self.log_on_change = True
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_session_dir = os.path.join(os.getcwd(), "logs", ts)
+        self.log_session_dir = os.path.join(base_dir_path, "logs", ts)
         os.makedirs(self.log_session_dir, exist_ok=True)
 
         self.config_file = "config.json"
+
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MyCompanyName.MyProductName.PCMonitor")
+            self.setWindowIcon(QIcon(os.path.join(base_dir_path, "app.ico")))
+        except Exception as e:
+            print(f"[警告] アイコンの設定に失敗しました: {e}")
+
         self.log_settings = {
             'fast': {'enabled': True, 'interval': 1, 'last_run': 0, 'func': dll_pc.pm_log_system_fast},
             'corelog': {'enabled': True, 'interval': 1, 'last_run': 0, 'func': self.log_core_details},
@@ -357,14 +390,12 @@ class MonitorApp(QMainWindow):
 
         return self.create_panel("Control & Logging", layout)
 
-    # 修正後
     def on_log_on_change_changed(self, state):
         with self.data_lock:
             self.log_on_change = (state == 2)
         print(f"[DEBUG] 'log_on_change' state changed to: {self.log_on_change}")
 
     def update_log_setting(self, key, setting_name, value):
-        """ログ設定を更新する"""
         self.log_settings[key][setting_name] = value
         print(f"[DEBUG] Log setting updated: {key}.{setting_name} = {value}")
 
@@ -507,7 +538,8 @@ class MonitorApp(QMainWindow):
         if self.log_settings['detail']['enabled']: dll_pc.pm_detail_active_write_header(self.log_paths['detail'])
         if self.log_settings['snapshot']['enabled']: dll_pc.pm_snapshot_write_header(self.log_paths['snapshot'])
         with self.data_lock:
-            self.core_log_buffer.clear(); self.last_logged_core_data.clear()
+            self.core_log_buffer.clear();
+            self.last_logged_core_data.clear()
         if self.log_settings['corelog']['enabled']:
             try:
                 with open(self.log_paths['corelog'], 'w', newline='', encoding='utf-8') as f:
@@ -549,7 +581,7 @@ class MonitorApp(QMainWindow):
             info = self.core_info[i]
             phys_idx = info['physical_core_num'] - 1
             usage, clock, temp, voltage = data['usage_arr'][i], data['cpu_info']['core_clocks'].get(phys_idx), \
-            data['cpu_info']['core_temps'].get(phys_idx), data['cpu_info']['core_voltages'].get(phys_idx)
+                data['cpu_info']['core_temps'].get(phys_idx), data['cpu_info']['core_voltages'].get(phys_idx)
             margin = (data['cpu_info']['tjmax'] - temp) if temp and data['cpu_info']['tjmax'] else None
 
             if log_on_change:
@@ -721,10 +753,22 @@ class MonitorApp(QMainWindow):
 if __name__ == "__main__":
     import clr
 
-    clr.AddReference("LibreHardwareMonitorLib")
+    # ★ 修正点: DLLS_DIR (IDE/EXEで切り替えたパス) を sys.path に追加
+    if DLLS_DIR not in sys.path:
+        sys.path.append(DLLS_DIR)
+
+    try:
+        clr.AddReference("LibreHardwareMonitorLib")
+        print("[INFO] .NET CLR (LibreHardwareMonitorLib) のロード準備完了。")
+    except Exception as e:
+        print(f"[致命的エラー] .NET CLR のロードに失敗: {e}")
+        sys.exit(1)
+
     app = QApplication(sys.argv)
+
+    # CLRロード後に LHM のインポートと初期化を実行
     initialize_hardware_monitor()
+
     win = MonitorApp()
     win.show()
     sys.exit(app.exec())
-

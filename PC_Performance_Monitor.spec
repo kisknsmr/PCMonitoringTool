@@ -1,40 +1,46 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+import os
+import glob
+HERE = os.path.abspath(os.path.dirname(SPECPATH))
 
 a = Analysis(
     ['main.py'],
-    pathex=[],
+    pathex=[HERE],
     binaries=[],
-    datas=[('pcmonitor.dll', '.'), ('getcoreinfo.dll', '.'), ('LibreHardwareMonitorLib.dll', '.')],
-    hiddenimports=[],
+    datas=[
+        # ★ 'DLLs' フォルダの "中身 (*.dll)" を
+        # ★ EXEと同じ場所 ('.') にコピーする
+        (f, '.') for f in glob.glob(os.path.join(HERE, 'DLLs', '*.dll'))
+    ] + [
+        # ★ 'app.ico' もEXEと同じ場所 ('.') にコピー
+        ('app.ico', '.')
+    ],
+    hiddenimports=[
+        'pythonnet',
+        'clr',
+        'System'
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
     excludes=[],
     noarchive=False,
-    optimize=0,
+    optimize=0
 )
+
 pyz = PYZ(a.pure)
 
+# ★ COLLECTブロックを "削除"
+# EXEブロックにすべてを渡す (レガシーフラット形式)
 exe = EXE(
     pyz,
     a.scripts,
     a.binaries,
     a.datas,
-    [],
+    a.zipfiles,
     name='PC_Performance_Monitor',
-    debug=False,
-    bootloader_ignore_signals=False,
-    strip=False,
-    upx=True,
-    upx_exclude=[],
-    runtime_tmpdir=None,
     console=False,
-    disable_windowed_traceback=False,
-    argv_emulation=False,
-    target_arch=None,
-    codesign_identity=None,
-    entitlements_file=None,
-    icon=['app.ico'],
-    manifest='manifest.xml',
+    icon='app.ico',
+    uac_admin=True
 )
