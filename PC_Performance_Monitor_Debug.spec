@@ -34,34 +34,33 @@ a = Analysis(
 # Pythonライブラリをまとめた .pyz アーカイブを作成
 pyz = PYZ(a.pure)
 
-# --- EXEブロック (修正箇所) ---
+# --- EXEブロック (デバッグ用に修正) ---
+# 実行ファイル(.exe)を作成する設定
 exe = EXE(
-    pyz,
-    a.scripts,
-    [],
-    [],
-    [],
-    exclude_binaries=True,
-    name='PC_Performance_Monitor',
-    debug=False, # Trueにするとより詳細な情報が出る場合があるが、まずはFalseで
+    pyz,                         # Pythonライブラリのアーカイブ
+    a.scripts,                   # メインスクリプト ([main.py])
+    [],                          # バイナリはCOLLECTで処理するので空リスト
+    [],                          # データファイルはCOLLECTで処理するので空リスト
+    [],                          # ZIPファイルはCOLLECTで処理するので空リスト
+    exclude_binaries=True,       # EXE自体にバイナリを含めない (COLLECTで処理)
+    name='PC_Performance_Monitor_Debug', # ★ デバッグ用として別名に ★
+    debug='all',                 # ★ PyInstallerのデバッグ情報をすべて出力 ★
     bootloader_ignore_signals=False,
-    strip=False,
-    upx=False,
-    console=False, # ★ FalseからTrueに変更 ★
+    strip=False,                 # シンボル情報を削除しない
+    upx=False,                   # UPX圧縮を無効にする
+    console=True,                # ★ コンソールウィンドウを表示する ★
     disable_windowed_traceback=False,
     argv_emulation=False,
-    target_arch=None,
+    target_arch=None,            # アーキテクチャ (Noneで自動)
     codesign_identity=None,
     entitlements_file=None,
-    icon='app.ico',
-    uac_admin=True
+    icon='app.ico',              # EXEのアイコンファイル
+    uac_admin=True               # 管理者権限を要求 (manifestは自動生成)
 )
-# --- COLLECTブロック (変更なし) ---
-# (略)
 
-# --- COLLECTブロック (追加) ---
+# --- COLLECTブロック ---
 # EXEファイルと、それ以外の依存ファイル(バイナリ, データファイル)を
-# 指定したフォルダ(name='PC_Performance_Monitor')にまとめる
+# 指定したフォルダ(name='PC_Performance_Monitor_Debug')にまとめる
 coll = COLLECT(
     exe,                         # 上記で作成したEXEオブジェクト
     a.binaries,                  # Analysisで集めたバイナリファイル
@@ -70,5 +69,5 @@ coll = COLLECT(
     strip=False,                 # シンボル情報を削除しない
     upx=False,                   # UPX圧縮を無効にする
     upx_exclude=[],              # UPX圧縮から除外するファイル (upx=Falseなので影響なし)
-    name='PC_Performance_Monitor' # 出力フォルダ名 (dist/PC_Performance_Monitor)
+    name='PC_Performance_Monitor_Debug' # ★ 出力フォルダ名もデバッグ用に変更 ★
 )

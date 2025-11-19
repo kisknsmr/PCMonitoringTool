@@ -31,16 +31,10 @@ def base_dir():
         else os.path.dirname(os.path.abspath(__file__))
 
 
-# ★ 修正点: 実行モードによってDLLの場所を切り替える
-base_dir_path = base_dir()
-if getattr(sys, 'frozen', False):
-    # PyInstaller実行時 (EXEと同じ場所)
-    DLLS_DIR = base_dir_path
-else:
-    # IDE実行時 (スクリプトの 'DLLs' サブフォルダ)
-    DLLS_DIR = os.path.join(base_dir_path, 'DLLs')
+# 常に 'DLLs' サブフォルダを参照する
+DLLS_DIR = os.path.join(base_dir(), 'DLLs')
 
-# グローバル変数としてcomputerとHardwareを初期化
+# グローバル変数
 computer = None
 Hardware = None
 
@@ -53,7 +47,7 @@ class PROCINFO(ctypes.Structure):
         ("cpu", ctypes.c_double),
         ("ram", ctypes.c_size_t),
         ("swap", ctypes.c_size_t),
-        ("name", ctypes.c_char * 260)  # MAX_PATH
+        ("name", ctypes.c_char * 260)
     ]
 
 
@@ -61,9 +55,16 @@ class PROCINFO(ctypes.Structure):
 # C++ DLLのロードと関数定義
 # ==========================
 try:
-    # ★ 修正点: os.add_dll_directory のブロックを "削除" (不要)
+    # EXE実行時(_internal)にDLLの依存関係(getcoreinfo等)を見つけるため
+    if getattr(sys, 'frozen', False):
+        if hasattr(os, 'add_dll_directory'):
+            try:
+                os.add_dll_directory(DLLS_DIR)
+            except Exception:
+                pass
+        else:
+            os.environ['PATH'] = DLLS_DIR + os.pathsep + os.environ['PATH']
 
-    # DLLS_DIR (切り替え後のパス) からDLLパスを構築
     dll_pc_path = os.path.join(DLLS_DIR, "pcmonitor.dll")
     dll_core_path = os.path.join(DLLS_DIR, "getcoreinfo.dll")
 
@@ -97,17 +98,17 @@ try:
     dll_core.get_core_count.restype = ctypes.c_int
     dll_core.get_core_usage.argtypes = [ctypes.POINTER(ctypes.c_double), ctypes.c_int]
     dll_core.get_core_usage.restype = ctypes.c_int
-    print("[INFO] C++ DLL (pcmonitor, getcoreinfo) のロードに成功しました。")
+
 except (FileNotFoundError, OSError) as e:
-    print(f"DLLのロードに失敗しました: {e}")
+    # ここでエラーが出た場合はコンソール（またはGUIなし終了）になるが、
+    # 本番環境ではログファイル出力機構を別途設けない限りユーザーには見えない。
     sys.exit(1)
 
 
 # ==========================
-# LibreHardwareMonitor の初期化 (関数内インポート)
+# LibreHardwareMonitor の初期化
 # ==========================
 def initialize_hardware_monitor():
-    """LibreHardwareMonitorを初期化する"""
     global computer, Hardware
     try:
         from LibreHardwareMonitor import Hardware as LHM_Hardware
@@ -115,14 +116,11 @@ def initialize_hardware_monitor():
         computer = Hardware.Computer()
         computer.IsCpuEnabled = True
         computer.Open()
-        print("[INFO] LibreHardwareMonitorの初期化に成功しました。")
-    except Exception as e:
-        print(f"LibreHardwareMonitorの初期化に失敗しました: {e}")
+    except Exception:
         computer = None
 
 
 def get_cpu_info():
-    """CPUの各コア温度、クロック、電力、電圧、スロットリング状態などを取得する"""
     if not computer:
         return {'core_temps': {}, 'core_clocks': {}, 'core_voltages': {}, 'package_temp': None, 'tjmax': None,
                 'package_power': None, 'is_throttling': False}
@@ -174,9 +172,6 @@ def get_cpu_info():
     return info
 
 
-# ==========================
-# GUIウィジェット
-# ==========================
 class TemperatureGraph(QWidget):
     def __init__(self, max_points=60):
         super().__init__()
@@ -239,16 +234,16 @@ class MonitorApp(QMainWindow):
         self.log_on_change = True
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        self.log_session_dir = os.path.join(base_dir_path, "logs", ts)
+        self.log_session_dir = os.path.join(base_dir(), "logs", ts)
         os.makedirs(self.log_session_dir, exist_ok=True)
 
         self.config_file = "config.json"
 
         try:
             ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("MyCompanyName.MyProductName.PCMonitor")
-            self.setWindowIcon(QIcon(os.path.join(base_dir_path, "app.ico")))
-        except Exception as e:
-            print(f"[警告] アイコンの設定に失敗しました: {e}")
+            self.setWindowIcon(QIcon(os.path.join(base_dir(), "app.ico")))
+        except Exception:
+            pass
 
         self.log_settings = {
             'fast': {'enabled': True, 'interval': 1, 'last_run': 0, 'func': dll_pc.pm_log_system_fast},
@@ -393,11 +388,9 @@ class MonitorApp(QMainWindow):
     def on_log_on_change_changed(self, state):
         with self.data_lock:
             self.log_on_change = (state == 2)
-        print(f"[DEBUG] 'log_on_change' state changed to: {self.log_on_change}")
 
     def update_log_setting(self, key, setting_name, value):
         self.log_settings[key][setting_name] = value
-        print(f"[DEBUG] Log setting updated: {key}.{setting_name} = {value}")
 
     def create_system_status_panel(self):
         layout = QGridLayout()
@@ -502,7 +495,6 @@ class MonitorApp(QMainWindow):
         """)
 
     def log_loop(self):
-        print("[DEBUG] Log loop thread started.")
         last_flush_time = time.time();
         FLUSH_INTERVAL = 10
         while self.running:
@@ -510,7 +502,6 @@ class MonitorApp(QMainWindow):
             for key, settings in self.log_settings.items():
                 if settings['enabled'] and (current_time - settings['last_run'] >= settings['interval']):
                     try:
-                        print(f"[DEBUG] Executing log function for '{key}'")
                         if key in ['detail', 'snapshot']:
                             with self.dll_proc_lock:
                                 settings['func'](self.log_paths.get(key))
@@ -518,22 +509,25 @@ class MonitorApp(QMainWindow):
                             settings['func'](self.log_paths.get(key))
                         settings['last_run'] = current_time
                     except Exception as e:
-                        print(f"[エラー] '{key}' ログ書き込み失敗: {e}")
+                        print(f"Log Error: {e}")
             if current_time - last_flush_time >= FLUSH_INTERVAL:
-                print("[DEBUG] Flushing core log buffer...")
                 self._flush_core_log_buffer()
                 last_flush_time = current_time
             time.sleep(0.5)
-        print("[DEBUG] Log loop thread finished.")
 
     def start_logging(self):
         if self.running: return
+
+        # ★★★ MBCSエンコード（Windows C++ DLL用） ★★★
+        encoding_type = 'mbcs'
+
         self.log_paths = {
-            'fast': os.path.join(self.log_session_dir, "fast.csv").encode('utf-8'),
-            'detail': os.path.join(self.log_session_dir, "detail.csv").encode('utf-8'),
-            'snapshot': os.path.join(self.log_session_dir, "snapshot.csv").encode('utf-8'),
+            'fast': os.path.join(self.log_session_dir, "fast.csv").encode(encoding_type),
+            'detail': os.path.join(self.log_session_dir, "detail.csv").encode(encoding_type),
+            'snapshot': os.path.join(self.log_session_dir, "snapshot.csv").encode(encoding_type),
             'corelog': os.path.join(self.log_session_dir, "corelog.csv")
         }
+
         if self.log_settings['fast']['enabled']: dll_pc.pm_log_fast_write_header(self.log_paths['fast'])
         if self.log_settings['detail']['enabled']: dll_pc.pm_detail_active_write_header(self.log_paths['detail'])
         if self.log_settings['snapshot']['enabled']: dll_pc.pm_snapshot_write_header(self.log_paths['snapshot'])
@@ -545,8 +539,8 @@ class MonitorApp(QMainWindow):
                 with open(self.log_paths['corelog'], 'w', newline='', encoding='utf-8') as f:
                     f.write(
                         "Timestamp,Throttling_Status,LP_Index,Core_Thread,Usage_Pct,Clock_MHz,Temp_C,Margin_C,Voltage_V,Is_Second_Thread\n")
-            except IOError as e:
-                print(f"corelogヘッダー書き込み失敗: {e}")
+            except IOError:
+                pass
         for key in self.log_settings: self.log_settings[key]['last_run'] = 0
         self.running = True;
         self.status_label.setText("STATUS: 🟢 LOGGING");
@@ -609,9 +603,8 @@ class MonitorApp(QMainWindow):
             try:
                 with open(self.log_paths['corelog'], 'a', newline='', encoding='utf-8') as f:
                     f.write('\n'.join(lines) + '\n')
-                print(f"[DEBUG] corelogバッファから{len(lines)}行を書き込みました。")
-            except IOError as e:
-                print(f"corelogバッファ書き込み失敗: {e}")
+            except IOError:
+                pass
 
     def update_gui(self):
         cpu_info = get_cpu_info()
@@ -631,7 +624,6 @@ class MonitorApp(QMainWindow):
             for key, s in log_settings.items():
                 if key in self.log_settings: self.log_settings[key].update(s)
             self.log_on_change = self.config.get('log_on_change', True)
-            print("前回の設定を読み込みました。")
         except (FileNotFoundError, json.JSONDecodeError):
             pass
 
@@ -647,8 +639,8 @@ class MonitorApp(QMainWindow):
         try:
             with open(self.config_file, 'w') as f:
                 json.dump(config_to_save, f, indent=4)
-        except IOError as e:
-            print(f"設定の保存に失敗: {e}")
+        except IOError:
+            pass
 
     def update_cpu_global_info(self, cpu_info, usage_arr):
         avg_usage = sum(usage_arr) / self.core_count if self.core_count > 0 else 0
@@ -741,7 +733,7 @@ class MonitorApp(QMainWindow):
                 table.resizeColumnsToContents()
                 table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         except Exception as e:
-            print(f"トッププロセス更新エラー: {e}")
+            print(f"Top Process Error: {e}")
 
     def closeEvent(self, event):
         self._flush_core_log_buffer();
@@ -753,22 +745,16 @@ class MonitorApp(QMainWindow):
 if __name__ == "__main__":
     import clr
 
-    # ★ 修正点: DLLS_DIR (IDE/EXEで切り替えたパス) を sys.path に追加
     if DLLS_DIR not in sys.path:
         sys.path.append(DLLS_DIR)
 
     try:
         clr.AddReference("LibreHardwareMonitorLib")
-        print("[INFO] .NET CLR (LibreHardwareMonitorLib) のロード準備完了。")
-    except Exception as e:
-        print(f"[致命的エラー] .NET CLR のロードに失敗: {e}")
+    except Exception:
         sys.exit(1)
 
     app = QApplication(sys.argv)
-
-    # CLRロード後に LHM のインポートと初期化を実行
     initialize_hardware_monitor()
-
     win = MonitorApp()
     win.show()
     sys.exit(app.exec())
