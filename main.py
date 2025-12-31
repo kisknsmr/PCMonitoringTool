@@ -20,7 +20,7 @@ from PyQt6.QtCore import QTimer, Qt, QPointF, QByteArray
 
 
 # ==========================
-# 実行パス／DLLパスの設定
+# 実行パス／DLLパスの設定c
 # ==========================
 def base_dir():
     """

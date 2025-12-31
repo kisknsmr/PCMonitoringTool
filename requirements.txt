@@ -1,0 +1,7 @@
+# GUIフレームワーク
+PyQt6
+
+# .NETランタイムとの連携 (LibreHardwareMonitorLib.dll 呼び出し用)
+pythonnet
+
+# プロセス情報の取得（ctypes経由でpcmonitor.dll等を使用する場合は基本ライブラリで完結）
