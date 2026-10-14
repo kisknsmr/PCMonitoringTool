@@ -7,15 +7,21 @@ from datetime import datetime
 import collections
 import json
 import re
+import csv
+import shutil
+import subprocess
+
+import psutil
 
 # .NETランタイムのインポートはmainブロックで行う
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QTableWidget, QTableWidgetItem,
-    QHeaderView, QGroupBox, QProgressBar, QComboBox, QCheckBox
+    QHeaderView, QGroupBox, QProgressBar, QComboBox, QCheckBox,
+    QSystemTrayIcon, QMenu
 )
-from PyQt6.QtGui import QFont, QPainter, QPen, QColor, QPainterPath, QIcon
+from PyQt6.QtGui import QFont, QPainter, QPen, QColor, QPainterPath, QIcon, QAction
 from PyQt6.QtCore import QTimer, Qt, QPointF, QByteArray
 
 
@@ -172,6 +178,114 @@ def get_cpu_info():
     return info
 
 
+# ==========================
+# バッファ付き CSV 書き出し（Process_Logger-Prototype から移植）
+# ==========================
+class BufferedLogger:
+    """行をためておき、一定数たまったらまとめて書き出す。ディスクへの書き込み回数を減らす。"""
+
+    def __init__(self, filepath, headers, buffer_size=50):
+        self.filepath = filepath
+        self.buffer_size = buffer_size
+        self.buffer = []
+        self.lock = threading.Lock()
+        try:
+            with open(self.filepath, 'w', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerow(headers)
+        except IOError as e:
+            print(f"BufferedLogger header error: {e}")
+
+    def add_row(self, row):
+        with self.lock:
+            self.buffer.append(row)
+            if len(self.buffer) >= self.buffer_size:
+                self._flush()
+
+    def _flush(self):
+        if not self.buffer:
+            return
+        try:
+            with open(self.filepath, 'a', newline='', encoding='utf-8') as f:
+                csv.writer(f).writerows(self.buffer)
+            self.buffer.clear()
+        except IOError as e:
+            print(f"BufferedLogger flush error: {e}")
+
+    def force_flush(self):
+        with self.lock:
+            self._flush()
+
+
+# ==========================
+# ディスク・ネットワーク・GPU の取得（Process_Logger-Prototype から移植）
+# ==========================
+def _disk_root():
+    return os.environ.get('SystemDrive', 'C:') + '\\' if sys.platform.startswith('win') else '/'
+
+
+class IoSampler:
+    """psutil でディスク・ネットワークの速度を、nvidia-smi で GPU の状態を取る。"""
+
+    GPU_INTERVAL = 5  # nvidia-smi は起動コストがあるため、間隔を空けて呼ぶ
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.last_time = time.time()
+        self.last_net = psutil.net_io_counters()
+        self.last_disk = psutil.disk_io_counters()
+        self.latest = {'disk_pct': None, 'disk_r': 0.0, 'disk_w': 0.0, 'net_sent': 0.0, 'net_recv': 0.0,
+                       'gpu_load': None, 'gpu_mem': None, 'gpu_temp': None}
+        self.nvidia_smi = shutil.which('nvidia-smi')
+        self.gpu_enabled = True
+        if self.nvidia_smi:
+            threading.Thread(target=self._gpu_loop, daemon=True).start()
+
+    def sample(self):
+        """ディスク・ネットワークを更新する（GUIのタイマーから呼ぶ）。"""
+        now = time.time()
+        dt = now - self.last_time
+        if dt <= 0:
+            return
+        try:
+            net = psutil.net_io_counters()
+            disk = psutil.disk_io_counters()
+            mb = 1024 * 1024
+            values = {
+                'disk_pct': psutil.disk_usage(_disk_root()).percent,
+                'net_sent': (net.bytes_sent - self.last_net.bytes_sent) / mb / dt,
+                'net_recv': (net.bytes_recv - self.last_net.bytes_recv) / mb / dt,
+            }
+            if disk and self.last_disk:
+                values['disk_r'] = (disk.read_bytes - self.last_disk.read_bytes) / mb / dt
+                values['disk_w'] = (disk.write_bytes - self.last_disk.write_bytes) / mb / dt
+            self.last_net, self.last_disk, self.last_time = net, disk, now
+            with self.lock:
+                self.latest.update(values)
+        except Exception as e:
+            print(f"IoSampler error: {e}")
+
+    def _gpu_loop(self):
+        flags = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        while True:
+            if self.gpu_enabled:
+                try:
+                    out = subprocess.run(
+                        [self.nvidia_smi, '--query-gpu=utilization.gpu,memory.used,memory.total,temperature.gpu',
+                         '--format=csv,noheader,nounits'],
+                        capture_output=True, text=True, timeout=5, creationflags=flags).stdout
+                    load, mem_used, mem_total, temp = [float(v) for v in out.splitlines()[0].split(',')]
+                    with self.lock:
+                        self.latest.update({'gpu_load': load, 'gpu_temp': temp,
+                                            'gpu_mem': mem_used / mem_total * 100 if mem_total else None})
+                except Exception:
+                    pass
+            time.sleep(self.GPU_INTERVAL)
+
+    def get(self):
+        with self.lock:
+            return dict(self.latest)
+
+
 class TemperatureGraph(QWidget):
     def __init__(self, max_points=60):
         super().__init__()
@@ -232,6 +346,9 @@ class MonitorApp(QMainWindow):
         self.dll_proc_lock = threading.Lock()
         self.core_log_buffer = []
         self.log_on_change = True
+        self.io_sampler = IoSampler()
+        self.io_logger = None
+        self.force_quit = False
 
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         self.log_session_dir = os.path.join(base_dir(), "logs", ts)
@@ -249,11 +366,14 @@ class MonitorApp(QMainWindow):
             'fast': {'enabled': True, 'interval': 1, 'last_run': 0, 'func': dll_pc.pm_log_system_fast},
             'corelog': {'enabled': True, 'interval': 1, 'last_run': 0, 'func': self.log_core_details},
             'detail': {'enabled': True, 'interval': 2, 'last_run': 0, 'func': dll_pc.pm_log_detail_active},
-            'snapshot': {'enabled': False, 'interval': 600, 'last_run': 0, 'func': dll_pc.pm_log_snapshot}
+            'snapshot': {'enabled': False, 'interval': 600, 'last_run': 0, 'func': dll_pc.pm_log_snapshot},
+            'io': {'enabled': True, 'interval': 1, 'last_run': 0, 'func': self.log_io}
         }
         self.load_settings()
+        self.io_sampler.gpu_enabled = self.config.get('gpu_enabled', True)
         self.core_info = self._initialize_core_info()
         self.initUI()
+        self._setup_tray()
         self.update_gui()
 
         self.timer = QTimer(self);
@@ -346,7 +466,7 @@ class MonitorApp(QMainWindow):
 
         grid = QGridLayout()
         log_types = {'fast': 'Fast System Log', 'corelog': 'Core Details Log', 'detail': 'Active Detail Log',
-                     'snapshot': 'Periodic Snapshot'}
+                     'snapshot': 'Periodic Snapshot', 'io': 'Disk / Net / GPU Log'}
         intervals = ["1", "2", "5", "10", "30", "60", "300", "600"]
 
         for i, (key, name) in enumerate(log_types.items()):
@@ -372,8 +492,16 @@ class MonitorApp(QMainWindow):
         self.log_on_change_checkbox.stateChanged.connect(self.on_log_on_change_changed)
         self.start_on_launch_checkbox = QCheckBox("Start logging on launch");
         self.start_on_launch_checkbox.setChecked(self.config.get('start_on_launch', False))
+        self.gpu_checkbox = QCheckBox("Measure GPU (NVIDIA)")
+        self.gpu_checkbox.setChecked(self.io_sampler.gpu_enabled)
+        self.gpu_checkbox.setEnabled(bool(self.io_sampler.nvidia_smi))
+        self.gpu_checkbox.stateChanged.connect(lambda state: setattr(self.io_sampler, 'gpu_enabled', state == 2))
+        self.tray_checkbox = QCheckBox("Keep running in tray when closed")
+        self.tray_checkbox.setChecked(self.config.get('close_to_tray', False))
         grid.addWidget(self.log_on_change_checkbox, len(log_types), 0, 1, 3)
         grid.addWidget(self.start_on_launch_checkbox, len(log_types) + 1, 0, 1, 3)
+        grid.addWidget(self.gpu_checkbox, len(log_types) + 2, 0, 1, 3)
+        grid.addWidget(self.tray_checkbox, len(log_types) + 3, 0, 1, 3)
         layout.addLayout(grid)
 
         status_vbox = QVBoxLayout()
@@ -404,6 +532,22 @@ class MonitorApp(QMainWindow):
         layout.addWidget(QLabel("Swap Memory:"), 1, 0);
         layout.addWidget(self.swap_progress, 1, 1);
         layout.addWidget(self.swap_value_label, 1, 2)
+
+        # ディスク・ネットワーク・GPU（Process_Logger-Prototype から移植）
+        self.disk_progress = QProgressBar()
+        self.disk_value_label = QLabel("N/A")
+        self.gpu_progress = QProgressBar()
+        self.gpu_value_label = QLabel("N/A")
+        self.disk_io_label = QLabel("Disk I/O: N/A")
+        self.net_io_label = QLabel("Network: N/A")
+        layout.addWidget(QLabel("Disk Usage:"), 2, 0)
+        layout.addWidget(self.disk_progress, 2, 1)
+        layout.addWidget(self.disk_value_label, 2, 2)
+        layout.addWidget(QLabel("GPU Load:"), 3, 0)
+        layout.addWidget(self.gpu_progress, 3, 1)
+        layout.addWidget(self.gpu_value_label, 3, 2)
+        layout.addWidget(self.disk_io_label, 4, 0, 1, 3)
+        layout.addWidget(self.net_io_label, 5, 0, 1, 3)
         layout.setColumnStretch(1, 1)
         return self.create_panel("System Status", layout)
 
@@ -525,8 +669,14 @@ class MonitorApp(QMainWindow):
             'fast': os.path.join(self.log_session_dir, "fast.csv").encode(encoding_type),
             'detail': os.path.join(self.log_session_dir, "detail.csv").encode(encoding_type),
             'snapshot': os.path.join(self.log_session_dir, "snapshot.csv").encode(encoding_type),
-            'corelog': os.path.join(self.log_session_dir, "corelog.csv")
+            'corelog': os.path.join(self.log_session_dir, "corelog.csv"),
+            'io': os.path.join(self.log_session_dir, "io.csv")
         }
+        self.io_logger = None
+        if self.log_settings['io']['enabled']:
+            self.io_logger = BufferedLogger(self.log_paths['io'], [
+                "Timestamp", "Disk_Pct", "Disk_Read_MBps", "Disk_Write_MBps", "Net_Sent_MBps", "Net_Recv_MBps",
+                "GPU_Load_Pct", "GPU_Mem_Pct", "GPU_Temp_C"])
 
         if self.log_settings['fast']['enabled']: dll_pc.pm_log_fast_write_header(self.log_paths['fast'])
         if self.log_settings['detail']['enabled']: dll_pc.pm_detail_active_write_header(self.log_paths['detail'])
@@ -551,6 +701,7 @@ class MonitorApp(QMainWindow):
         self.start_on_launch_checkbox.setEnabled(False)
         self.log_thread = threading.Thread(target=self.log_loop, daemon=True);
         self.log_thread.start()
+        self._update_tray_tooltip()
 
     def stop_logging(self):
         if not self.running: return
@@ -562,6 +713,59 @@ class MonitorApp(QMainWindow):
         self.log_on_change_checkbox.setEnabled(True);
         self.start_on_launch_checkbox.setEnabled(True)
         self._flush_core_log_buffer()
+        if self.io_logger:
+            self.io_logger.force_flush()
+        self._update_tray_tooltip()
+
+    def log_io(self, file_path_ignored):
+        """ディスク・ネットワーク・GPU の最新値を io.csv に追記する（バッファ経由）。"""
+        if not self.io_logger:
+            return
+        d = self.io_sampler.get()
+
+        def fmt(v, f="{:.3f}"):
+            return '' if v is None else f.format(v)
+
+        self.io_logger.add_row([datetime.now().strftime('%Y-%m-%d %H:%M:%S'), fmt(d['disk_pct'], "{:.1f}"),
+                                fmt(d['disk_r']), fmt(d['disk_w']), fmt(d['net_sent']), fmt(d['net_recv']),
+                                fmt(d['gpu_load'], "{:.0f}"), fmt(d['gpu_mem'], "{:.1f}"),
+                                fmt(d['gpu_temp'], "{:.0f}")])
+
+    # ==========================
+    # タスクトレイ常駐（Process_Logger-Prototype から移植。PyQt 標準の QSystemTrayIcon を使用）
+    # ==========================
+    def _setup_tray(self):
+        self.tray = None
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            return
+        icon = self.windowIcon()
+        if icon.isNull():
+            icon = QIcon(os.path.join(base_dir(), "app.ico"))
+        self.tray = QSystemTrayIcon(icon, self)
+        menu = QMenu()
+        show_action = QAction("Show", self)
+        show_action.triggered.connect(self._show_from_tray)
+        exit_action = QAction("Exit", self)
+        exit_action.triggered.connect(self._quit_from_tray)
+        menu.addAction(show_action)
+        menu.addAction(exit_action)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(
+            lambda reason: self._show_from_tray() if reason == QSystemTrayIcon.ActivationReason.DoubleClick else None)
+        self._update_tray_tooltip()
+        self.tray.show()
+
+    def _update_tray_tooltip(self):
+        if getattr(self, 'tray', None):
+            self.tray.setToolTip(f"PC Performance Monitor - {'LOGGING' if self.running else 'IDLE'}")
+
+    def _show_from_tray(self):
+        self.showNormal()
+        self.activateWindow()
+
+    def _quit_from_tray(self):
+        self.force_quit = True
+        self.close()
 
     def log_core_details(self, file_path_ignored):
         with self.data_lock:
@@ -611,6 +815,8 @@ class MonitorApp(QMainWindow):
         usage_arr = (ctypes.c_double * self.core_count)()
         dll_core.get_core_usage(usage_arr, self.core_count)
         with self.data_lock: self.data_cache = {'cpu_info': cpu_info, 'usage_arr': list(usage_arr)}
+        self.io_sampler.sample()
+        self.update_io_info()
         self.update_memory_info();
         self.update_cpu_global_info(cpu_info, usage_arr);
         self.update_core_table(cpu_info, usage_arr)
@@ -633,6 +839,8 @@ class MonitorApp(QMainWindow):
                              self.log_settings.items()},
             'log_on_change': self.log_on_change,
             'start_on_launch': self.start_on_launch_checkbox.isChecked(),
+            'gpu_enabled': self.gpu_checkbox.isChecked(),
+            'close_to_tray': self.tray_checkbox.isChecked(),
             'window_geometry': self.saveGeometry().toHex().data().decode(),
             'table_header_state': self.core_table.horizontalHeader().saveState().toHex().data().decode()
         }
@@ -664,6 +872,20 @@ class MonitorApp(QMainWindow):
         self.avg_core_temp_label.setText(f"Avg Temp: {avg_temp:.1f} °C" if avg_temp is not None else "Avg Temp: N/A")
 
         if pkg_temp is not None: self.temp_graph.add_point(pkg_temp)
+
+    def update_io_info(self):
+        d = self.io_sampler.get()
+        if d['disk_pct'] is not None:
+            self.disk_progress.setValue(int(d['disk_pct']))
+            self.disk_value_label.setText(f"{d['disk_pct']:.1f}% ({_disk_root()})")
+        if d['gpu_load'] is not None:
+            self.gpu_progress.setValue(int(d['gpu_load']))
+            temp = f", {d['gpu_temp']:.0f} °C" if d['gpu_temp'] is not None else ""
+            self.gpu_value_label.setText(f"{d['gpu_load']:.0f}%{temp}")
+        elif not self.io_sampler.nvidia_smi:
+            self.gpu_value_label.setText("N/A (no NVIDIA GPU)")
+        self.disk_io_label.setText(f"Disk I/O: R {d['disk_r']:.2f} / W {d['disk_w']:.2f} MB/s")
+        self.net_io_label.setText(f"Network: ↑ {d['net_sent']:.2f} / ↓ {d['net_recv']:.2f} MB/s")
 
     def update_memory_info(self):
         total, used, _, swap_total, swap_used, _ = (ctypes.c_double() for _ in range(6))
@@ -736,8 +958,21 @@ class MonitorApp(QMainWindow):
             print(f"Top Process Error: {e}")
 
     def closeEvent(self, event):
+        # 「トレイに残す」設定なら、×ボタンでは隠すだけにして記録を続ける
+        if self.tray and self.tray_checkbox.isChecked() and not self.force_quit:
+            event.ignore()
+            self.hide()
+            self.save_settings()
+            self.tray.showMessage("PC Performance Monitor", "Running in the tray. Right-click the icon to exit.",
+                                  QSystemTrayIcon.MessageIcon.Information, 3000)
+            return
+        self.running = False
         self._flush_core_log_buffer();
+        if self.io_logger:
+            self.io_logger.force_flush()
         self.save_settings()
+        if self.tray:
+            self.tray.hide()
         if computer: computer.Close()
         super().closeEvent(event)
 

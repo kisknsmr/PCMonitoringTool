@@ -5,3 +5,6 @@ PyQt6
 pythonnet
 
 # プロセス情報の取得（ctypes経由でpcmonitor.dll等を使用する場合は基本ライブラリで完結）
+
+# ディスク・ネットワークの速度の取得
+psutil
